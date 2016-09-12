@@ -30,6 +30,148 @@ fix.lcdb.indexcomperr <- function(){
 }
 
 
+#' check risky factor
+#'
+#' calculate factor return f data and the residual data
+#' @author Andrew Dow
+#' @param TS is a TS object.
+#' @param riskfactorLists is a set of risk factors for regressing.
+#' @return a list,contains TSFR,alphaf,riskf,residual
+#' @examples
+#' RebDates <- getRebDates(as.Date('2012-12-31'),as.Date('2016-06-30'),rebFreq = 'week')
+#' TS <- getTS(RebDates,'EI000985')
+#' riskfactorLists <- buildFactorLists(
+#' buildFactorList(factorFun = "gf.ln_mkt_cap",factorDir = -1,factorNA = "median",factorStd = "norm")
+#' )
+#' factorIDs <- c("F000006","F000015","F000016")
+#' tmp <- buildFactorLists_lcfs(factorIDs,factorStd="norm",factorNA = "median")
+#' riskfactorLists <- c(riskfactorLists,tmp)
+#' risk.factor.test
+#' @export
+risk.factor.test <- function(TS,alphafactorLists,riskfactorLists){
+  alphaname <- sapply(alphafactorLists,'[[','factorName')
+  riskname <- sapply(riskfactorLists,'[[','factorName')
+  dates <- unique(TS$date)
+  pb <- txtProgressBar(style=3)
+  for (i in 1:length(dates)) {
+    setTxtProgressBar(pb, i/length(dates))
+    tmp.TS <- TS[TS$date==dates[i],]
+    
+    TSR <- getTSR(tmp.TS,months(1))
+    TSR <- na.omit(TSR)
+    if(nrow(TSR)==0) next
+    TSR <- TSR[TSR$periodrtn>=(mean(TSR$periodrtn)-3*sd(TSR$periodrtn)),]
+    TSR <- TSR[TSR$periodrtn<=(mean(TSR$periodrtn)+3*sd(TSR$periodrtn)),]
+    tmp <- c(rdate2int(TSR$date[1]),rdate2int(TSR$date_end[1]))
+    qr <- paste("select * from QT_UnTradingDay where TradingDay in",
+                paste("(",paste(tmp,collapse = ','),")",sep=''))
+    con <- db.local()
+    re <- dbGetQuery(con,qr)
+    dbDisconnect(con)
+    re$TradingDay <- intdate2r(re$TradingDay)
+    TSR <- TSR[!(TSR$stockID %in% re[re$TradingDay==TSR$date[1],'ID']),]
+    TSR <- TSR[!(TSR$stockID %in% re[re$TradingDay==TSR$date_end[1],'ID']),]
+    
+    TSF <- getMultiFactor(TSR[,c('date','stockID')],c(alphafactorLists,riskfactorLists))
+    TSF <- TSF[,c('date','stockID',alphaname,riskname)]
+    
+    TSS <- getSectorID(TSR[,c('date','stockID')],sectorAttr = list(33,1))
+    #TSS[is.na(TSS$sector),'sector'] <- 'ES33510000'
+    TSS <- TSS[!is.na(TSS$sector),]
+    TSS <- dcast(TSS,date+stockID~sector,length,fill=0,value.var = 'sector')
+    indname <- colnames(TSS)[-1:-2]
+    
+
+    
+    #merge data
+    TSF <- merge(TSF,TSS,by=c('date','stockID'),all.x=T)
+    TSFR <- merge(TSF,TSR,by=c('date','stockID'),all.x=T)
+    TSFR <- na.omit(TSFR)
+    if(nrow(TSFR)==0) next
+    TSFR <- arrange(TSFR,stockID)
+    
+    wgt <- getTSF(TSFR[,c('date','stockID')],'gf_lcfs',factorPar = list(factorID='F000001'),
+                   factorStd = 'none',factorNA = "median")
+    wgt$factorscore <- sqrt(wgt$factorscore)
+    wgt <- arrange(wgt,stockID)
+    
+    #industry only
+    fname <- indname
+    indrsquare <- getrsquare(TSFR,fname,wgt)
+    colnames(indrsquare)[-1] <- c('indlm','indglm')
+    
+    #industry size
+    fname <- c("ln_mkt_cap_",indname)
+    indsizersquare <- getrsquare(TSFR,fname,wgt)
+    colnames(indsizersquare)[-1] <- c('indsizelm','indsizeglm')
+    
+    #industry risk
+    fname <- c(riskname,indname)
+    indriskrsquare <- getrsquare(TSFR,fname,wgt)
+    colnames(indriskrsquare)[-1] <- c('indrisklm','indriskglm')
+    
+    #industry risk alpha
+    fname <- c(alphaname,riskname,indname)
+    indallrsquare <- getrsquare(TSFR,fname,wgt)
+    colnames(indallrsquare)[-1] <- c('indalllm','indallglm')
+    if(i==1){
+      rsquare <- cbind(indrsquare,indsizersquare[,-1],indriskrsquare[,-1],indallrsquare[,-1])
+    }else{
+      tmp <- cbind(indrsquare,indsizersquare[,-1],indriskrsquare[,-1],indallrsquare[,-1])
+      rsquare <- rbind(rsquare,tmp)
+    }
+    
+    
+  }
+  close(pb)
+
+  
+  
+}
+
+
+rs <- xts(rsquare[,-1],order.by = rsquare[,1])
+ggplot.ts.line(rs)
+rs <- rollmean(rs,12)
+ggplot.ts.line(rs)
+
+getrsquare <- function(TSFR,fname,wgt){
+  tmp.x <- as.matrix(TSFR[,fname])
+  tmp.x <- subset(tmp.x,select = (colnames(tmp.x)[colSums(tmp.x)!=0]))
+  tmp.r <- as.matrix(TSFR[,"periodrtn"])
+  tmp.w <- as.matrix(wgt[,"factorscore"])
+  tmp.w <- diag(c(tmp.w),length(tmp.w))
+  lm.f <- solve(t(tmp.x) %*% tmp.x) %*% t(tmp.x) %*% tmp.r
+  glm.f <- solve(crossprod(tmp.x,tmp.w) %*% tmp.x) %*% crossprod(tmp.x,tmp.w) %*% tmp.r
+  
+  lm.res <- tmp.r-tmp.x %*% lm.f
+  glm.res <- tmp.r-tmp.x %*% glm.f
+  lm.rsquare <- 1-sum(lm.res^2)/sum((tmp.r-mean(tmp.r))^2)
+  glm.rsquare <- 1-sum(glm.res^2)/sum((tmp.r-mean(tmp.r))^2)
+
+  rsquare <- data.frame(date=TSFR$date_end[1],lm=lm.rsquare,glm=glm.rsquare)
+  return(rsquare)
+}
+
+
+
+
+
+#' get alpha factor's historical VIF 
+#'
+#' calculate factor return f data and the residual data
+#' @author Andrew Dow
+#' @param TSF is a TSF object.
+#' @param alphafactorLists is a set of alpha factors for regressing.
+#' @param riskfactorLists is a set of risk factors for regressing.
+#' @param regresstype choose the regress type,the default type is glm.
+#' @return a list,contains TSFR,alphaf,riskf,residual
+#' @examples 
+#' calcfres(TSF,alphafactorLists,riskfactorLists)
+#' @export
+factor.VIF <- function(TS,riskfactorLists){
+  
+}
 
 
 
@@ -41,46 +183,44 @@ fix.lcdb.indexcomperr <- function(){
 #' calcfres
 #'
 #' calculate factor return f data and the residual data
+#' @rdname calcfres
 #' @author Andrew Dow
-#' @param TSF is a TSF object.
-#' @param alphafactorLists is a set of alpha factors for regressing.
-#' @param riskfactorLists is a set of risk factors for regressing.
+#' @param TSFR is a TSFR object.
 #' @param regresstype choose the regress type,the default type is glm.
-#' @return a list,contains TSFR,alphaf,riskf,residual
+#' @param sectorAttr
+#' @param alphafname a charactor string vector. IF missing, then the alphaf and riskf with be mixed together.
+#' @return calcfresbyTS return a list, contains alphaf,riskf,residual.
 #' @examples 
-#' calcfres(TSF,alphafactorLists,riskfactorLists)
-calcfres <- function(TSF,alphafactorLists,riskfactorLists,regresstype=c('glm','lm')){
+#' calcfresbyTSFR(TSFR)
+calcfresbyTSFR <- function(TSFR,regresstype=c('glm','lm'),sectorAttr=defaultSectorAttr,alphafname){
   ptm <- proc.time()
   regresstype <- match.arg(regresstype)
   
-  TS <- TSF[,c('date','stockID')]
+  TS <- TSFR[,c('date','stockID')]
   
   cat("getting sector id......","\n")
-  TSS <- getSectorID(TS,sectorAttr = list(33,1))
-  TSS[is.na(TSS$sector),'sector'] <- 'ES33510000'
-  TSS <- dcast(TSS,date+stockID~sector,length,fill=0,value.var = 'sector')
-  
-  cat("getting period return......","\n")
-  TSR <- getTSR(TS)
+  TSS <- getSectorID(TS,sectorAttr = sectorAttr)
+  TSS <- sectorNA_fill(TSS,sectorAttr=sectorAttr)
+  TSS <- reshape2::dcast(TSS,date+stockID~sector,length,fill=0,value.var = 'sector')
   
   #merge data
-  TSF <- merge(TSF,TSS,by =c("date","stockID"))
-  TSFR <- merge(TSF,TSR,by =c("date","stockID"))
+  TSFR <- merge(TSFR,TSS,by =c("date","stockID"))
   
   cat("calculating f and residual......","\n")
   if(regresstype=='glm'){
     #get liquid market value
     TSFv <- getTSF(TS,'gf.float_cap',factorStd = 'none',factorNA = "median")
     TSFv$factorscore <- sqrt(TSFv$factorscore)
+    TSFv <- dplyr::rename(TSFv,sqrtFV=factorscore)
     TSFRv <- merge(TSFR,TSFv,by =c("date","stockID"))
     dates <- unique(TSFRv$date)
     for(i in 1:(length(dates)-1)){
       tmp.tsfr <- TSFRv[TSFRv$date==dates[i],]
-      tmp.x <- as.matrix(tmp.tsfr[,-c(1,2,ncol(tmp.tsfr)-2,ncol(tmp.tsfr)-1,ncol(tmp.tsfr))])
+      tmp.x <- as.matrix(dplyr::select(tmp.tsfr,-stockID,-date,-date_end,-periodrtn,-sqrtFV))
       tmp.x <- subset(tmp.x,select = (colnames(tmp.x)[colSums(tmp.x)!=0]))
       tmp.r <- as.matrix(tmp.tsfr[,"periodrtn"])
       tmp.r[is.na(tmp.r)] <- mean(tmp.r,na.rm = T)
-      tmp.w <- as.matrix(tmp.tsfr[,"factorscore"])
+      tmp.w <- as.matrix(tmp.tsfr[,"sqrtFV"])
       tmp.w <- diag(c(tmp.w),length(tmp.w))
       tmp.f <- solve(crossprod(tmp.x,tmp.w) %*% tmp.x) %*% crossprod(tmp.x,tmp.w) %*% tmp.r
       tmp.residual <- tmp.r-tmp.x %*% tmp.f
@@ -112,15 +252,41 @@ calcfres <- function(TSF,alphafactorLists,riskfactorLists,regresstype=c('glm','l
       }
     }
   }
-  alphafname <- sapply(alphafactorLists,'[[','factorName')
-  alphaf <- f[f$fname %in% alphafname,]
-  riskf <- f[!(f$fname %in% alphafname),]
-  re <- list(TSFR,alphaf,riskf,residual)
+  
+  if(missing(alphafname)){
+    re <- list(f,residual)
+  } else {
+    alphaf <- f[f$fname %in% alphafname,]
+    riskf <- f[!(f$fname %in% alphafname),]
+    re <- list(alphaf,riskf,residual)
+  }
+  
   tpassed <- proc.time()-ptm
   tpassed <- tpassed[3]
   cat("This function running time is ",tpassed/60,"min.")
   return(re)
 }
+
+
+#' @rdname calcfres
+#' @param TS
+#' @param alphafactorLists is a set of alpha factors for regressing.
+#' @param riskfactorLists is a set of risk factors for regressing.
+#' @param dure
+#' @return calcfresbyTSFR return a list contains TSFR,alphaf,riskf,residual.
+#' @export
+#' @examples 
+#' calcfresbyTS(TS,alphafactorLists,riskfactorLists)
+calcfresbyTS <- function(TS,alphafactorLists,riskfactorLists,regresstype=c('glm','lm'),
+                         sectorAttr=defaultSectorAttr(),
+                         dure=months(1)){
+  factorLists <- c(alphafactorLists,riskfactorLists)
+  TSF <- getMultiFactor(TS,FactorLists = factorLists)
+  TSFR <- getTSR(TSF,dure=dure)
+  fres <- calcfresbyTSFR(TSFR = TSFR,regresstype = regresstype,sectorAttr = sectorAttr,alphafname=sapply(alphafactorLists,'[[','factorName'))
+  re <- c(list(TSFR),fres)
+}
+
 
 
 
@@ -135,7 +301,7 @@ calcfres <- function(TSF,alphafactorLists,riskfactorLists,regresstype=c('glm','l
 #' calcFDelta(riskf,residual)
 calcFDelta <- function(riskf,residual,rollingperiod=36){
   ptm <- proc.time()
-  f <- dcast(riskf,date~fname,fill=0,value.var = 'fvalue')
+  f <- reshape2::dcast(riskf,date~fname,fill=0,value.var = 'fvalue')
   f <- arrange(f,date)
   # the follow rolling covariance for loop can be optimized.
   for(i in rollingperiod:nrow(f)){
@@ -218,8 +384,8 @@ OptWgt <- function(TSF,alphaf,Fcov,Delta,constr=c('IndSty','Ind','IndStyTE'),ben
       
       #get benchmark stock component weight and sector info. 
       benchmarkdata <- getIndexCompWgt(indexID = benchmark,i)
-      sec <- getSectorID(benchmarkdata[,c('date','stockID')],sectorAttr = list(33,1))
-      sec[is.na(sec$sector),"sector"] <- 'ES33510000'
+      sec <- getSectorID(benchmarkdata[,c('date','stockID')],sectorAttr = sectorAttr)
+      sec <- sectorNA_fill(sec,sectorAttr=sectorAttr)
       benchmarkdata <- merge(benchmarkdata,sec,by=c('date','stockID'))
       totwgt <- ddply(benchmarkdata,.(sector),summarise,secwgt=sum(wgt))
       totwgt$wgtlb <- totwgt$secwgt*(1-indfexp)
@@ -262,8 +428,8 @@ OptWgt <- function(TSF,alphaf,Fcov,Delta,constr=c('IndSty','Ind','IndStyTE'),ben
       tmp <- data.frame(date=as.Date(i),stockID=rownames(alphamat),wgt=res$solution)
       tmp <- merge(tmp,benchmarkdata[,c("date","stockID","wgt")],by = c("date","stockID"),all.x = T)
       colnames(tmp) <-c( "date","stockID","wgtopt","wgtinbench")
-      tmp.sec <- getSectorID(tmp[,c('date','stockID')],sectorAttr = list(33,1))
-      tmp.sec[is.na(tmp.sec$sector),"sector"] <- 'ES33510000'
+      tmp.sec <- getSectorID(tmp[,c('date','stockID')],sectorAttr = sectorAttr)
+      tmp.sec <- sectorNA_fill(tmp.sec,sectorAttr=sectorAttr)
       tmp <- merge(tmp,tmp.sec,by=c('date','stockID'))
       if(i==dates[1]){
         result <- tmp
@@ -288,8 +454,8 @@ OptWgt <- function(TSF,alphaf,Fcov,Delta,constr=c('IndSty','Ind','IndStyTE'),ben
         
         #get benchmark stock component weight and sector info. 
         benchmarkdata <- getIndexCompWgt(indexID = benchmark,i)
-        sec <- getSectorID(benchmarkdata[,c('date','stockID')],sectorAttr = list(33,1))
-        sec[is.na(sec$sector),"sector"] <- 'ES33510000'
+        sec <- getSectorID(benchmarkdata[,c('date','stockID')],sectorAttr = sectorAttr)
+        sec <- sectorNA_fill(sec,sectorAttr=sectorAttr)
         benchmarkdata <- merge(benchmarkdata,sec,by=c('date','stockID'))
       
         secwgt <- ddply(benchmarkdata,.(sector),summarise,secwgt=sum(wgt))
@@ -341,8 +507,8 @@ OptWgt <- function(TSF,alphaf,Fcov,Delta,constr=c('IndSty','Ind','IndStyTE'),ben
         tmp <- data.frame(date=as.Date(i),stockID=rownames(alphamat),wgt=res$solution)
         tmp <- merge(tmp,benchmarkdata[,c("date","stockID","wgt")],by = c("date","stockID"),all.x = T)
         colnames(tmp) <-c( "date","stockID","wgtopt","wgtinbench")
-        tmp.sec <- getSectorID(tmp[,c('date','stockID')],sectorAttr = list(33,1))
-        tmp.sec[is.na(tmp.sec$sector),"sector"] <- 'ES33510000'
+        tmp.sec <- getSectorID(tmp[,c('date','stockID')],sectorAttr = sectorAttr)
+        tmp.sec <- sectorNA_fill(tmp.sec,sectorAttr=sectorAttr)
         tmp <- merge(tmp,tmp.sec,by=c('date','stockID'))
         if(i==dates[1]){
           result <- tmp
