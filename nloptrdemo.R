@@ -83,6 +83,3 @@ print(nl)
 nl$solution
 nl$objective
 
-
-
-
