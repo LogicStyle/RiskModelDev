@@ -3,7 +3,8 @@
 RebDates <- getRebDates(as.Date('2010-01-31'),as.Date('2017-05-31'),'month')
 TS <- getTS(RebDates,'EI000985')
 
-gf.NP_stat <- function(TS,Nbin=lubridate::years(-3)){
+gf.NP_stat <- function(TS,Nbin=lubridate::years(-3),type=c('simple','lm')){
+  type <- match.arg(type)
   
   #get report date 
   begT <- trday.offset(min(TS$date),Nbin)
@@ -26,20 +27,38 @@ gf.NP_stat <- function(TS,Nbin=lubridate::years(-3)){
   TSFdata <- rptTS.getFin_ts(rptTS,funchar)
   
   rtndata <- TSFdata %>% dplyr::group_by(stockID) %>%
-    dplyr::mutate(growth = np_belongto_parcomsh / dplyr::lag(np_belongto_parcomsh, 4) - 1)
+    dplyr::mutate(growth =(np_belongto_parcomsh - dplyr::lag(np_belongto_parcomsh, 4))/abs(dplyr::lag(np_belongto_parcomsh, 4)))
   
   
   TSnew <- getrptDate_newest(TS)
+  TSnew <- na.omit(TSnew)
   TSnew <- dplyr::rename(TSnew,rptDateEnd=rptDate)
   TSnew$rptDateBeg <- TSnew$rptDateEnd %m+% Nbin
   
-  TSFdata <- TSFdata %>% dplyr::full_join(TSnew,by='stockID') %>% 
-    dplyr::filter(rptDate>rptDateBeg,rptDate<=rptDateEnd) %>% 
-    dplyr::arrange(date,stockID,rptDate)
-  TSnew %>% rowwise() %>% do(i = seq(.$x, .$y))
-  .Last.value %>% summarise(n = length(i))
+  tmp <- dplyr::distinct(TSnew,rptDateBeg,rptDateEnd)
+  tmp <- tmp %>% dplyr::rowwise() %>% 
+    dplyr::do(rptDateBeg=.$rptDateBeg,rptDateEnd=.$rptDateEnd,rptDate = getrptDate(.$rptDateBeg, .$rptDateEnd,type = 'between')) %>% 
+    dplyr::do(data.frame(rptDateBeg=.$rptDateBeg,rptDateEnd=.$rptDateEnd,rptDate = .$rptDate))
   
+  TSnew <- dplyr::full_join(TSnew,tmp,by=c('rptDateBeg','rptDateEnd'))
+  TSnew <- transform(TSnew,rptDateBeg=NULL,rptDateEnd=NULL)
   
+  TSFdata <- dplyr::left_join(TSnew,rtndata[,c("rptDate","stockID","growth")],by=c('stockID','rptDate'))
+  TSFdata <- na.omit(TSFdata)
+  TSFdata <- TSFdata[!is.infinite(TSFdata$growth),]
+  TSFdata <- TSFdata %>% dplyr::group_by(date,stockID) %>% dplyr::mutate(id =row_number())
+  
+  N <- max(TSFdata$id)
+  TSF <- TSFdata %>% group_by(date,stockID) %>% filter(max(id) > N/2) %>%  summarise(factorscore=mean(growth)/sd(growth))
+  TSF <- left_join(TS,TSF,by=c('date','stockID'))
+  
+  TSF <- TSFdata %>% group_by(date,stockID) %>% filter(max(id) > N/2) %>%  summarise(factorscore=mean(growth))
+  TSF <- left_join(TS,TSF,by=c('date','stockID'))
+  TSF <- RFactorModel:::factor.std(TSF,factorStd = 'sectorNe',sectorAttr = list(std=list(factorList1,33),level=list(5,1)))
+  TSFR <- getTSR(TSF)
+  chart.IC(TSFR)
+  chart.Ngroup.spread(TSFR)
+  table.Ngroup.overall(TSFR)
 }
 
 
@@ -64,6 +83,8 @@ getrptDate <- function(begT,endT,type=c('between','forward','backward')){
   }
   return(rptDate)
 }
+
+
 
 gf.EPS_stat <- function(TS,Nbin='3 years'){
   #get report date 
