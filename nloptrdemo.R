@@ -1,85 +1,110 @@
-require(MASS)
-require(nloptr)
-#Covariance structure for the simulation
-#give everything a std=.1
-Posdef <- function (n, ev = runif(n, 0, 10)) 
-{
-  Z <- matrix(ncol=n, rnorm(n^2))
-  decomp <- qr(Z)
-  Q <- qr.Q(decomp) 
-  R <- qr.R(decomp)
-  d <- diag(R)
-  ph <- d / abs(d)
-  O <- Q %*% diag(ph)
-  Z <- t(O) %*% diag(ev) %*% O
-  return(Z)
-}
-n = 300
-cov <- Posdef(n)
-std = matrix(0,n,n)
-for(i in 1:n){      
-  std[i,i] = round(runif(1,0.1,0.9),digits = 1)
+
+
+RebDates <- getRebDates(as.Date('2010-01-31'),as.Date('2017-05-31'),'month')
+TS <- getTS(RebDates,'EI000985')
+
+gf.NP_stat <- function(TS,Nbin=lubridate::years(-3),type=c('simple','lm')){
+  type <- match.arg(type)
+  
+  #get report date 
+  begT <- trday.offset(min(TS$date),Nbin)
+  begT <- trday.offset(begT,lubridate::years(-1))
+  endT <- max(TS$date)
+  rptDate <- getrptDate(begT,endT,type = 'forward')
+  
+  rptTS <- expand.grid(rptDate = rptDate, stockID = unique(TS$stockID),
+                       KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE)
+  rptTS <- dplyr::arrange(rptTS,rptDate,stockID)
+  
+  #remove report dates before IPO 
+  tmp <- data.frame(date=max(TS$date),stockID = unique(TS$stockID),stringsAsFactors=FALSE)
+  tmp <- TS.getTech_ts(tmp, funchar="Firstday()",varname='IPODay')
+  tmp <- transform(tmp,date=NULL,IPODay=tsdate2r(IPODay))
+  rptTS <- dplyr::left_join(rptTS,tmp,by='stockID')
+  rptTS <- rptTS[rptTS$rptDate>rptTS$IPODay,c('rptDate','stockID')]
+ 
+  funchar <- '"np_belongto_parcomsh",LastQuarterData(RDate,46078,0)'
+  TSFdata <- rptTS.getFin_ts(rptTS,funchar)
+  
+  rtndata <- TSFdata %>% dplyr::group_by(stockID) %>%
+    dplyr::mutate(growth =(np_belongto_parcomsh - dplyr::lag(np_belongto_parcomsh, 4))/abs(dplyr::lag(np_belongto_parcomsh, 4)))
+  
+  
+  TSnew <- getrptDate_newest(TS)
+  TSnew <- na.omit(TSnew)
+  TSnew <- dplyr::rename(TSnew,rptDateEnd=rptDate)
+  TSnew$rptDateBeg <- TSnew$rptDateEnd %m+% Nbin
+  
+  tmp <- dplyr::distinct(TSnew,rptDateBeg,rptDateEnd)
+  tmp <- tmp %>% dplyr::rowwise() %>% 
+    dplyr::do(rptDateBeg=.$rptDateBeg,rptDateEnd=.$rptDateEnd,rptDate = getrptDate(.$rptDateBeg, .$rptDateEnd,type = 'between')) %>% 
+    dplyr::do(data.frame(rptDateBeg=.$rptDateBeg,rptDateEnd=.$rptDateEnd,rptDate = .$rptDate))
+  
+  TSnew <- dplyr::full_join(TSnew,tmp,by=c('rptDateBeg','rptDateEnd'))
+  TSnew <- transform(TSnew,rptDateBeg=NULL,rptDateEnd=NULL)
+  
+  TSFdata <- dplyr::left_join(TSnew,rtndata[,c("rptDate","stockID","growth")],by=c('stockID','rptDate'))
+  TSFdata <- na.omit(TSFdata)
+  TSFdata <- TSFdata[!is.infinite(TSFdata$growth),]
+  TSFdata <- TSFdata %>% dplyr::group_by(date,stockID) %>% dplyr::mutate(id =row_number())
+  
+  N <- max(TSFdata$id)
+  TSF <- TSFdata %>% group_by(date,stockID) %>% filter(max(id) > N/2) %>%  summarise(factorscore=mean(growth)/sd(growth))
+  TSF <- left_join(TS,TSF,by=c('date','stockID'))
+  
+  TSF <- TSFdata %>% group_by(date,stockID) %>% filter(max(id) > N/2) %>%  summarise(factorscore=mean(growth))
+  TSF <- left_join(TS,TSF,by=c('date','stockID'))
+  TSF <- RFactorModel:::factor.std(TSF,factorStd = 'sectorNe',sectorAttr = list(std=list(factorList1,33),level=list(5,1)))
+  TSFR <- getTSR(TSF)
+  chart.IC(TSFR)
+  chart.Ngroup.spread(TSFR)
+  table.Ngroup.overall(TSFR)
 }
 
-corr <- solve(std)%*% cov %*%solve(std)
-corr <- corr/(max(abs(corr)))
-for(i in 1:n){      
-  corr[i,i] = 1
-}
-cov = std %*% corr %*% std
 
-#Simulate 10,000 draws
-sim = mvrnorm(n=10000,rep(0,n),cov)
-#feasible starting values of equal weights
-w = rep(1/n,n)
-#ES function.  Mean of values above alpha
-es = function(w,sim=NA,alpha=.05){
-  ret = sort(sim %*% w)
-  n = length(ret)
-  i = alpha * n
-  es = mean(ret[1:i])
-  return(-es)  
-}
-#linear equality constraint
-#note: nloptr requires all functions to have the same signature
-eval_g0 <- function(w,sim=NA,alpha=NA) {
-  return( sum(w) - 1 )
-}
-#numerical approximation of the gradient
-des = function(w,sim=NA,alpha=.05){
-  n = length(w)
-  out = w;
-  for (i in 0:n){
-    up = w;
-    dn = w;
-    up[i] = up[i]+.0001
-    dn[i] = dn[i]-.0001
-    out[i] = (es(up,sim=sim,alpha=alpha) - es(dn,sim=sim,alpha=alpha))/.0002
+getrptDate <- function(begT,endT,type=c('between','forward','backward')){
+  type <- match.arg(type)
+  
+  tmp <- seq(begT,endT,by='day')
+  if(type=='forward'){
+    tmp <- lubridate::floor_date(tmp, "quarter")-lubridate::days(1)
+  }else if(type=='backward'){
+    tmp <- lubridate::ceiling_date(tmp, "quarter")-lubridate::days(1)
+  }else{
+    tmp <- c(lubridate::floor_date(tmp, "quarter")-lubridate::days(1),
+             lubridate::ceiling_date(tmp, "quarter")-lubridate::days(1))
+    
   }
-  return(out)
+
+  rptDate <- sort(unique(tmp))
+  if(type=='between'){
+    rptDate <- rptDate[rptDate>=begT]
+    rptDate <- rptDate[rptDate<=endT]
+  }
+  return(rptDate)
 }
-#use nloptr to check out gradient
-#check.derivatives(w,es,des,sim=sim, alpha=.05)
-#function to optimize — a list of objective and gradient
-toOpt = function(w,sim=NA,alpha=.05){
-  list(objective=es(w,sim=sim,alpha=alpha),gradient=des(w,sim=sim,alpha=alpha))    
+
+
+
+gf.EPS_stat <- function(TS,Nbin='3 years'){
+  #get report date 
+  rptDate <- trday.offset(min(TS$date),Nbin)
+  rptDate <- getRebDates(rptDate,max(TS$date))
+  rptDate <- unique(lubridate::floor_date(rptDate, "quarter")-lubridate::days(1))
+  rptTS <- expand.grid(rptDate = rptDate, stockID = unique(TS$stockID),
+                       KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE)
+  rptTS <- dplyr::arrange(rptTS,rptDate,stockID)
+  
+  #remove report dates before IPO 
+  tmp <- data.frame(date=max(TS$date),stockID = unique(TS$stockID),stringsAsFactors=FALSE)
+  tmp <- TS.getTech_ts(tmp, funchar="Firstday()",varname='IPODay')
+  tmp <- transform(tmp,date=NULL,IPODay=tsdate2r(IPODay))
+  rptTS <- dplyr::left_join(rptTS,tmp,by='stockID')
+  rptTS <- rptTS[rptTS$rptDate>rptTS$IPODay,c('rptDate','stockID')]
+  
+  funchar <- '"eps",LastQuarterData(RDate,9900000,0)'
+  TSFdata2 <- rptTS.getFin_ts(rptTS,funchar)
+  
+  
 }
-#equality constraint function.  The jacobian is 1 for all variables
-eqCon = function(w,sim=NA,alpha=.05){
-  list(constraints=eval_g0(w,sim=NA,alpha=.05),jacobian=rep(1,n))     
-}
-#optimization options
-opts <- list( "algorithm" = "NLOPT_LD_SLSQP",
-              "xtol_rel" = 1.0e-7,
-              "maxeval" = 100000)
-#run optimization and print results
-system.time(nl <-  nloptr(w,toOpt,
-            lb = rep(0,n),
-            ub = rep(1,n),
-            eval_g_eq=eqCon,
-            opts=opts,
-            sim=sim,alpha=.05))
-print(nl)
-nl$solution
-nl$objective
 
