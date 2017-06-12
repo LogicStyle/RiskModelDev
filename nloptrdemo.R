@@ -1,6 +1,6 @@
 
 
-RebDates <- getRebDates(as.Date('2010-01-31'),as.Date('2017-05-31'),'month')
+RebDates <- getRebDates(as.Date('2011-01-31'),as.Date('2017-04-30'),'month')
 TS <- getTS(RebDates,'EI000985')
 
 gf.NP_stat <- function(TS,Nbin=lubridate::years(-3),type=c('simple','lm')){
