@@ -115,8 +115,38 @@ TS.getFinStat_ts <- function(TS,funchar,varname = funchar,Nbin=lubridate::years(
 }
 
 
+funddf <- data.frame(fundID=c('161207.OF','161213.OF',
+                              '161217.OF','159933.OF',
+                              '161211.OF','161223.OF',
+                              '001169.OF','161226.OF',
+                              '161227.OF'),
+            fundName=c('国投瑞银瑞和300','国投瑞银中证下游',
+                       '国投瑞银中证上游','国投瑞银沪深300金融地产ETF',
+                       '国投瑞银沪深300金融地产ETF联接','国投瑞银瑞泽中证创业成长',
+                       '国投瑞银新价值','国投瑞银白银期货',
+                       '国投瑞银瑞福深证100'),
+            begT=c(as.Date('2009-10-14'),as.Date('2010-12-16'),
+                   as.Date('2011-07-21'),as.Date('2013-09-17'),
+                   as.Date('2013-11-05'),as.Date('2015-03-17'),
+                   as.Date('2015-04-22'),as.Date('2015-08-06'),
+                   as.Date('2015-08-14')),
+                      stringsAsFactors = FALSE)
+rtndata <- data.frame()
+for(i in 1:nrow(funddf)){
+  if(funddf$begT[i]<as.Date('2012-01-01')){
+    tmp<-w.wsd(funddf$fundID[i],"NAV_adj_return1",as.Date('2012-01-01'),"2017-06-11")[[2]]
+  }else{
+    tmp<-w.wsd(funddf$fundID[i],"NAV_adj_return1",funddf$begT[i],"2017-06-11")[[2]]
+  }
+  
+  tmp <- transform(tmp,fundID=funddf$fundID[i],fundName=funddf$fundName[i],begT=funddf$begT[i])
+  rtndata <- rbind(tmp,rtndata)
+}
 
 
-
-
-
+rtn.ts <- reshape2::dcast(rtn,DATETIME~fundID,value.var = 'NAV_ADJ_RETURN1',fill = NA)
+rtn.ts <- rtn.ts[rtn.ts$DATETIME>as.Date('2012-01-01'),]
+tmp <- na.omit(tmp)
+tmp$NAV_ADJ_RETURN1 <- tmp$NAV_ADJ_RETURN1/100
+rtn.ts <- xts::xts(tmp[,-1],order.by = tmp[,1])
+rtn.periods(rtn.ts)
